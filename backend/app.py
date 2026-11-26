@@ -19,6 +19,15 @@ def run_migrations() -> None:
 with gr.Blocks(title="RepoSense AI Backend") as demo:
     gr.Markdown("# RepoSense AI Backend\nFastAPI + pgvector + Gemini RAG service is running on `/api/*` and `/health`.")
 
+try:
+    import spaces
+
+    @spaces.GPU
+    def _zero_gpu_warmup():
+        return "ready"
+except Exception:
+    pass
+
 app = gr.mount_gradio_app(fastapi_app, demo, path="/ui")
 
 
