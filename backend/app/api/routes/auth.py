@@ -10,7 +10,8 @@ from app.core.auth import (
 )
 from app.db.models import UserProfile
 from app.db.session import get_db
-from app.schemas.auth import UserProfileResponse
+from app.schemas.auth import AiQuotaResponse, UserProfileResponse
+from app.services.quota_service import get_ai_quota_status
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 _bearer_scheme = HTTPBearer(auto_error=False)
@@ -26,6 +27,15 @@ def get_me(
     if profile is None:
         profile = sync_user_profile(db, current_user, force=True)
     return profile
+
+
+@router.get("/ai-quota", response_model=AiQuotaResponse)
+def get_my_ai_quota(
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AiQuotaResponse:
+    """Return the authenticated user's 7-day AI assistant chat and word quota."""
+    return AiQuotaResponse(**get_ai_quota_status(db, current_user.id))
 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)

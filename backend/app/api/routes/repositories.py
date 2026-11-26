@@ -418,7 +418,10 @@ def ask_repository_assistant(
     settings: Settings = Depends(get_settings),
 ) -> RagAskResponse:
     """Ask the Gemini RAG assistant a question grounded in retrieved repository code."""
+    from app.services.quota_service import enforce_ai_quota
+
     rate_limiter.check(current_user.id, "assistant", max_requests=20, window_seconds=60.0)
+    enforce_ai_quota(db, current_user.id)
     repo = _get_repo_or_404(db, repository_id, current_user.id)
     return answer_repository_question(
         db=db,
@@ -426,6 +429,7 @@ def ask_repository_assistant(
         question=payload.question,
         settings=settings,
         top_k=payload.top_k,
+        user_id=current_user.id,
     )
 
 
@@ -438,7 +442,10 @@ def stream_repository_assistant(
     settings: Settings = Depends(get_settings),
 ) -> StreamingResponse:
     """Stream Gemini RAG assistant response tokens via Server-Sent Events."""
+    from app.services.quota_service import enforce_ai_quota
+
     rate_limiter.check(current_user.id, "assistant", max_requests=20, window_seconds=60.0)
+    enforce_ai_quota(db, current_user.id)
     repo = _get_repo_or_404(db, repository_id, current_user.id)
     return StreamingResponse(
         stream_repository_question(
@@ -447,6 +454,7 @@ def stream_repository_assistant(
             question=payload.question,
             settings=settings,
             top_k=payload.top_k,
+            user_id=current_user.id,
         ),
         media_type="text/event-stream",
         headers={

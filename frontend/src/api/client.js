@@ -115,6 +115,7 @@ export const api = {
   checkDbHealth: () => apiRequest("/health/db", {}, { cacheable: true }),
 
   getMe: () => apiRequest("/auth/me"),
+  getAiQuota: () => apiRequest("/auth/ai-quota"),
   logoutBackend: () =>
     apiRequest("/auth/logout", {
       method: "POST",

@@ -159,6 +159,7 @@ def answer_repository_question(
     question: str,
     settings: Settings,
     top_k: int = 5,
+    user_id: UUID | None = None,
 ) -> dict:
     """Run RAG pipeline: retrieve pgvector chunks and generate grounded answer via Gemini."""
     api_key, model_name, chunks, sufficient = _prepare_rag_context(db, repo, question, settings, top_k)
@@ -185,6 +186,10 @@ def answer_repository_question(
     )
 
     answer = _call_gemini(api_key=api_key, model=model_name, user_prompt=user_prompt)
+    if user_id is not None:
+        from app.services.quota_service import record_ai_chat_usage
+
+        record_ai_chat_usage(db, user_id=user_id, repository_id=repo.id, question=question, answer=answer)
 
     return {
         "repository_id": repo.id,
@@ -206,6 +211,7 @@ def stream_repository_question(
     question: str,
     settings: Settings,
     top_k: int = 5,
+    user_id: UUID | None = None,
 ) -> Iterator[str]:
     """Stream grounded Gemini RAG response tokens as Server-Sent Events."""
     api_key, model_name, chunks, sufficient = _prepare_rag_context(db, repo, question, settings, top_k)
@@ -242,6 +248,7 @@ def stream_repository_question(
     )
     url = f"{GEMINI_API_BASE}/{model_name}:streamGenerateContent"
     payload = _build_gemini_payload(user_prompt)
+    output_parts: list[str] = []
 
     try:
         with httpx.Client(timeout=60.0) as client:
@@ -275,6 +282,7 @@ def stream_repository_question(
                     parts = candidates[0].get("content", {}).get("parts", [])
                     text = "".join(p.get("text", "") for p in parts if isinstance(p, dict))
                     if text:
+                        output_parts.append(text)
                         yield _sse_event({"type": "delta", "text": text})
     except httpx.TimeoutException:
         yield _sse_event({"type": "error", "message": "Gemini API streaming request timed out."})
@@ -282,5 +290,16 @@ def stream_repository_question(
     except httpx.RequestError:
         yield _sse_event({"type": "error", "message": "Network error while streaming from Gemini API."})
         return
+
+    if user_id is not None and output_parts:
+        from app.services.quota_service import record_ai_chat_usage
+
+        record_ai_chat_usage(
+            db,
+            user_id=user_id,
+            repository_id=repo.id,
+            question=question,
+            answer="".join(output_parts),
+        )
 
     yield _sse_event({"type": "done"})

@@ -7,12 +7,22 @@ import { useRepo } from "../context/RepoContext";
 export default function AiAssistantPage() {
   const { selectedRepo } = useRepo();
   const [embStatus, setEmbStatus] = useState(null);
+  const [quota, setQuota] = useState(null);
   const [question, setQuestion] = useState("");
   const [messages, setMessages] = useState([]);
   const [asking, setAsking] = useState(false);
   const [generating, setGenerating] = useState(false);
   const [error, setError] = useState("");
   const bottomRef = useRef(null);
+
+  const loadQuota = useCallback(async () => {
+    try {
+      const q = await api.getAiQuota();
+      setQuota(q);
+    } catch {
+      setQuota(null);
+    }
+  }, []);
 
   const loadStatus = useCallback(async (repoId) => {
     try {
@@ -22,6 +32,10 @@ export default function AiAssistantPage() {
       setEmbStatus(null);
     }
   }, []);
+
+  useEffect(() => {
+    loadQuota();
+  }, [loadQuota]);
 
   useEffect(() => {
     setMessages([]);
@@ -56,6 +70,10 @@ export default function AiAssistantPage() {
     const trimmed = question.trim();
     if (!selectedRepo || trimmed.length < 3) {
       setError("Enter a question (at least 3 characters).");
+      return;
+    }
+    if (quota?.is_limited) {
+      setError("You have reached your 7-day AI assistant limit (6 chats or 400 words).");
       return;
     }
 
@@ -116,6 +134,7 @@ export default function AiAssistantPage() {
         prev.map((m) => (m.id === assistantId ? { ...m, streaming: false } : m))
       );
       setAsking(false);
+      loadQuota();
     }
   }
 
@@ -124,6 +143,7 @@ export default function AiAssistantPage() {
   }
 
   const ready = embStatus?.status === "completed";
+  const quotaBlocked = Boolean(quota?.is_limited);
 
   return (
     <div className="space-y-4">
@@ -136,17 +156,41 @@ export default function AiAssistantPage() {
             ? `${embStatus.total_embeddings}/${embStatus.total_chunks} chunks indexed for ${selectedRepo.owner}/${selectedRepo.name}`
             : "Checking embedding status..."}
         </div>
-        {!ready && (
-          <button
-            type="button"
-            onClick={handleGenerateEmbeddings}
-            disabled={generating}
-            className="rounded-md bg-zinc-100 px-3 py-1.5 text-xs font-semibold text-zinc-950 transition-colors hover:bg-white disabled:opacity-50"
-          >
-            {generating ? "Indexing..." : "Generate Embeddings"}
-          </button>
-        )}
+
+        <div className="flex flex-wrap items-center gap-3">
+          {quota && (
+            <span
+              className={`rounded border px-2 py-0.5 font-mono text-[11px] tabular-nums ${
+                quotaBlocked
+                  ? "border-amber-500/30 bg-amber-950/20 text-amber-300"
+                  : "border-zinc-800 bg-[#09090b] text-zinc-400"
+              }`}
+              title={`Rolling ${quota.window_days}-day limit`}
+            >
+              Quota ({quota.window_days}d): {quota.chats_used}/{quota.chats_limit} chats · {quota.words_used}/{quota.words_limit} words
+            </span>
+          )}
+          {!ready && (
+            <button
+              type="button"
+              onClick={handleGenerateEmbeddings}
+              disabled={generating}
+              className="rounded-md bg-zinc-100 px-3 py-1.5 text-xs font-semibold text-zinc-950 transition-colors hover:bg-white disabled:opacity-50"
+            >
+              {generating ? "Indexing..." : "Generate Embeddings"}
+            </button>
+          )}
+        </div>
       </section>
+
+      {quotaBlocked && (
+        <div className="rounded-lg border border-amber-500/30 bg-amber-950/20 px-4 py-3 text-xs text-amber-200">
+          7-day AI assistant limit reached ({quota.chats_used}/{quota.chats_limit} chats, {quota.words_used}/{quota.words_limit} words).{" "}
+          {quota.reset_at
+            ? `Next slot unlocks on ${new Date(quota.reset_at).toLocaleString()}.`
+            : "Please wait 7 days for your quota to reset."}
+        </div>
+      )}
 
       <section className="flex min-h-[500px] flex-col justify-between rounded-lg border border-zinc-800/80 bg-[#0b0b0e]">
         <div className="flex-1 space-y-4 overflow-y-auto p-5">
@@ -211,13 +255,17 @@ export default function AiAssistantPage() {
             type="text"
             value={question}
             onChange={(e) => setQuestion(e.target.value)}
-            placeholder="Ask about architecture, functions, classes, or dependencies..."
-            disabled={asking}
-            className="flex-1 rounded-md border border-zinc-800 bg-[#09090b] px-3 py-2 text-xs text-zinc-100 placeholder-zinc-500 focus:border-zinc-600 focus:outline-none"
+            placeholder={
+              quotaBlocked
+                ? "7-day AI assistant limit reached..."
+                : "Ask about architecture, functions, classes, or dependencies..."
+            }
+            disabled={asking || quotaBlocked}
+            className="flex-1 rounded-md border border-zinc-800 bg-[#09090b] px-3 py-2 text-xs text-zinc-100 placeholder-zinc-500 focus:border-zinc-600 focus:outline-none disabled:opacity-50"
           />
           <button
             type="submit"
-            disabled={asking || !ready}
+            disabled={asking || !ready || quotaBlocked}
             className="rounded-md bg-zinc-100 px-4 py-2 text-xs font-semibold text-zinc-950 transition-colors hover:bg-white disabled:cursor-not-allowed disabled:opacity-50"
           >
             {asking ? "Streaming..." : "Ask"}
