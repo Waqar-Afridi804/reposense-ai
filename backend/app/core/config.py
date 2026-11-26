@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str = ""
     GEMINI_MODEL: str = "gemini-3-flash-preview"
     EMBEDDING_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"
+    HF_TOKEN: str = ""
 
     # CORS
     CORS_ORIGINS: str = "http://localhost:5173"

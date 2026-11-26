@@ -11,11 +11,13 @@ from app.core.errors import register_exception_handlers
 
 
 def _prewarm_embedding_model() -> None:
-    """Load sentence-transformers/all-MiniLM-L6-v2 in the background so first search is fast."""
+    """Load sentence-transformers/all-MiniLM-L6-v2 in the background when running locally without HF_TOKEN."""
     try:
+        settings = get_settings()
+        if settings.HF_TOKEN.strip():
+            return
         from app.services.embedding_service import _load_sentence_transformer
 
-        settings = get_settings()
         model_name = settings.EMBEDDING_MODEL.strip() or "sentence-transformers/all-MiniLM-L6-v2"
         _load_sentence_transformer(model_name)
     except Exception:

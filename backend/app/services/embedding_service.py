@@ -1,20 +1,100 @@
 from functools import lru_cache
+import math
 from uuid import UUID
+import httpx
 from fastapi import status
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.core.config import Settings
+from app.core.config import Settings, get_settings
 from app.core.errors import AppError
 from app.db.models import CodeChunk, CodeEmbedding, EMBEDDING_DIMENSION
 from app.services.chunking_service import create_or_update_repository_chunks
 
 REQUIRED_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+HF_INFERENCE_URL = (
+    "https://router.huggingface.co/hf-inference/models/"
+    "sentence-transformers/all-MiniLM-L6-v2/pipeline/feature-extraction"
+)
+
+
+def _normalize_vector(vec: list[float]) -> list[float]:
+    norm = math.sqrt(sum(x * x for x in vec))
+    if norm <= 0.0:
+        return vec
+    return [x / norm for x in vec]
+
+
+def _embed_via_hf_inference(texts: list[str], hf_token: str) -> list[list[float]]:
+    """Generate normalized 384-dim embeddings via Hugging Face Inference API."""
+    results: list[list[float]] = []
+    headers = {
+        "Authorization": f"Bearer {hf_token}",
+        "Content-Type": "application/json",
+    }
+    with httpx.Client(timeout=45.0) as client:
+        for idx in range(0, len(texts), 32):
+            batch = texts[idx : idx + 32]
+            try:
+                resp = client.post(
+                    HF_INFERENCE_URL,
+                    headers=headers,
+                    json={"inputs": batch, "options": {"wait_for_model": True}},
+                )
+            except httpx.TimeoutException as exc:
+                raise AppError(
+                    message="Hugging Face embedding request timed out.",
+                    status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+                    code="embedding_timeout",
+                ) from exc
+            except httpx.RequestError as exc:
+                raise AppError(
+                    message="Network error while communicating with Hugging Face Inference API.",
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    code="embedding_network_error",
+                ) from exc
+
+            if resp.status_code == 401:
+                raise AppError(
+                    message="Invalid HF_TOKEN for Hugging Face Inference API.",
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    code="embedding_auth_error",
+                )
+            if resp.status_code == 429:
+                raise AppError(
+                    message="Hugging Face Inference API rate limit exceeded. Please try again shortly.",
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    code="embedding_rate_limited",
+                )
+            if resp.status_code >= 400:
+                raise AppError(
+                    message=f"Hugging Face Inference API returned status {resp.status_code}.",
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    code="embedding_generation_failed",
+                )
+
+            data = resp.json()
+            if not isinstance(data, list) or len(data) != len(batch):
+                raise AppError(
+                    message="Unexpected embedding response format from Hugging Face Inference API.",
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    code="embedding_generation_failed",
+                )
+
+            for raw_vec in data:
+                if not isinstance(raw_vec, list) or len(raw_vec) != EMBEDDING_DIMENSION:
+                    raise AppError(
+                        message=f"Embedding dimension mismatch: expected {EMBEDDING_DIMENSION}.",
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        code="embedding_dimension_mismatch",
+                    )
+                results.append(_normalize_vector([float(v) for v in raw_vec]))
+    return results
 
 
 @lru_cache(maxsize=1)
 def _load_sentence_transformer(model_name: str):
-    """Load and cache the SentenceTransformer model."""
+    """Load and cache the SentenceTransformer model for local fallback."""
     from sentence_transformers import SentenceTransformer
 
     model = SentenceTransformer(model_name)
@@ -32,6 +112,11 @@ def embed_texts(texts: list[str], model_name: str = REQUIRED_EMBEDDING_MODEL) ->
     """Generate normalized 384-dimensional embeddings for a list of strings."""
     if not texts:
         return []
+    settings = get_settings()
+    hf_token = settings.HF_TOKEN.strip()
+    if hf_token and "YOUR_HF" not in hf_token:
+        return _embed_via_hf_inference(texts, hf_token)
+
     try:
         model = _load_sentence_transformer(model_name)
         vectors = model.encode(
@@ -41,11 +126,17 @@ def embed_texts(texts: list[str], model_name: str = REQUIRED_EMBEDDING_MODEL) ->
             show_progress_bar=False,
         )
         return [vec.tolist() for vec in vectors]
+    except ImportError as exc:
+        raise AppError(
+            message="HF_TOKEN is not configured for remote embeddings.",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            code="embedding_not_configured",
+        ) from exc
     except AppError:
         raise
     except Exception as exc:
         raise AppError(
-            message="Failed to generate embeddings with sentence-transformers.",
+            message="Failed to generate embeddings.",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             code="embedding_generation_failed",
         ) from exc
