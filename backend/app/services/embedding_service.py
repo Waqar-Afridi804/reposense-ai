@@ -1,9 +1,8 @@
-from functools import lru_cache
 import math
 from uuid import UUID
 import httpx
 from fastapi import status
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings, get_settings
@@ -11,10 +10,9 @@ from app.core.errors import AppError
 from app.db.models import CodeChunk, CodeEmbedding, EMBEDDING_DIMENSION
 from app.services.chunking_service import create_or_update_repository_chunks
 
-REQUIRED_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-HF_INFERENCE_URL = (
-    "https://router.huggingface.co/hf-inference/models/"
-    "sentence-transformers/all-MiniLM-L6-v2/pipeline/feature-extraction"
+REQUIRED_EMBEDDING_MODEL = "gemini-embedding-001"
+GEMINI_BATCH_EMBED_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:batchEmbedContents"
 )
 
 
@@ -25,66 +23,67 @@ def _normalize_vector(vec: list[float]) -> list[float]:
     return [x / norm for x in vec]
 
 
-def _embed_via_hf_inference(texts: list[str], hf_token: str) -> list[list[float]]:
-    """Generate normalized 384-dim embeddings via Hugging Face Inference API."""
+def _embed_via_gemini(texts: list[str], api_key: str) -> list[list[float]]:
+    """Generate normalized 384-dim embeddings via Gemini batchEmbedContents API."""
     results: list[list[float]] = []
-    headers = {
-        "Authorization": f"Bearer {hf_token}",
-        "Content-Type": "application/json",
-    }
     with httpx.Client(timeout=45.0) as client:
-        for idx in range(0, len(texts), 32):
-            batch = texts[idx : idx + 32]
+        for idx in range(0, len(texts), 50):
+            batch = texts[idx : idx + 50]
+            requests_payload = [
+                {
+                    "model": "models/gemini-embedding-001",
+                    "content": {"parts": [{"text": text}]},
+                    "outputDimensionality": EMBEDDING_DIMENSION,
+                }
+                for text in batch
+            ]
             try:
                 resp = client.post(
-                    HF_INFERENCE_URL,
-                    headers=headers,
-                    json={"inputs": batch, "options": {"wait_for_model": True}},
+                    GEMINI_BATCH_EMBED_URL,
+                    params={"key": api_key},
+                    headers={"Content-Type": "application/json"},
+                    json={"requests": requests_payload},
                 )
             except httpx.TimeoutException as exc:
                 raise AppError(
-                    message="Hugging Face embedding request timed out.",
+                    message="Gemini embedding request timed out.",
                     status_code=status.HTTP_504_GATEWAY_TIMEOUT,
                     code="embedding_timeout",
                 ) from exc
             except httpx.RequestError as exc:
                 raise AppError(
-                    message="Network error while communicating with Hugging Face Inference API.",
+                    message="Network error while communicating with Gemini Embedding API.",
                     status_code=status.HTTP_502_BAD_GATEWAY,
                     code="embedding_network_error",
                 ) from exc
 
-            if resp.status_code == 401:
-                raise AppError(
-                    message="Invalid HF_TOKEN for Hugging Face Inference API.",
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    code="embedding_auth_error",
-                )
             if resp.status_code == 429:
                 raise AppError(
-                    message="Hugging Face Inference API rate limit exceeded. Please try again shortly.",
+                    message="Gemini API rate limit exceeded. Please try again shortly.",
                     status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                     code="embedding_rate_limited",
                 )
             if resp.status_code >= 400:
                 raise AppError(
-                    message=f"Hugging Face Inference API returned status {resp.status_code}.",
+                    message=f"Gemini Embedding API returned status {resp.status_code}. Check GEMINI_API_KEY.",
                     status_code=status.HTTP_502_BAD_GATEWAY,
                     code="embedding_generation_failed",
                 )
 
             data = resp.json()
-            if not isinstance(data, list) or len(data) != len(batch):
+            embeddings = data.get("embeddings") or []
+            if len(embeddings) != len(batch):
                 raise AppError(
-                    message="Unexpected embedding response format from Hugging Face Inference API.",
+                    message="Unexpected embedding response count from Gemini API.",
                     status_code=status.HTTP_502_BAD_GATEWAY,
                     code="embedding_generation_failed",
                 )
 
-            for raw_vec in data:
-                if not isinstance(raw_vec, list) or len(raw_vec) != EMBEDDING_DIMENSION:
+            for item in embeddings:
+                raw_vec = item.get("values") or []
+                if len(raw_vec) != EMBEDDING_DIMENSION:
                     raise AppError(
-                        message=f"Embedding dimension mismatch: expected {EMBEDDING_DIMENSION}.",
+                        message=f"Embedding dimension mismatch: expected {EMBEDDING_DIMENSION}, got {len(raw_vec)}.",
                         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                         code="embedding_dimension_mismatch",
                     )
@@ -92,69 +91,36 @@ def _embed_via_hf_inference(texts: list[str], hf_token: str) -> list[list[float]
     return results
 
 
-@lru_cache(maxsize=1)
-def _load_sentence_transformer(model_name: str):
-    """Load and cache the SentenceTransformer model for local fallback."""
-    from sentence_transformers import SentenceTransformer
-
-    model = SentenceTransformer(model_name)
-    dim = model.get_sentence_embedding_dimension()
-    if dim != EMBEDDING_DIMENSION:
-        raise AppError(
-            message=f"Embedding dimension mismatch: expected {EMBEDDING_DIMENSION}, got {dim}.",
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            code="embedding_dimension_mismatch",
-        )
-    return model
-
-
 def embed_texts(texts: list[str], model_name: str = REQUIRED_EMBEDDING_MODEL) -> list[list[float]]:
-    """Generate normalized 384-dimensional embeddings for a list of strings."""
+    """Generate normalized 384-dimensional embeddings for a list of strings via Gemini."""
     if not texts:
         return []
     settings = get_settings()
-    hf_token = settings.HF_TOKEN.strip()
-    if hf_token and "YOUR_HF" not in hf_token:
-        return _embed_via_hf_inference(texts, hf_token)
-
-    try:
-        model = _load_sentence_transformer(model_name)
-        vectors = model.encode(
-            texts,
-            batch_size=32,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-        )
-        return [vec.tolist() for vec in vectors]
-    except ImportError as exc:
+    api_key = settings.GEMINI_API_KEY.strip()
+    if not api_key or "YOUR_GEMINI" in api_key:
         raise AppError(
-            message="HF_TOKEN is not configured for remote embeddings.",
+            message="GEMINI_API_KEY is not configured.",
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            code="embedding_not_configured",
-        ) from exc
-    except AppError:
-        raise
-    except Exception as exc:
-        raise AppError(
-            message="Failed to generate embeddings.",
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            code="embedding_generation_failed",
-        ) from exc
+            code="gemini_not_configured",
+        )
+    return _embed_via_gemini(texts, api_key)
 
 
 def generate_repository_embeddings(db: Session, repository_id: UUID, settings: Settings) -> dict:
-    """Chunk repository files (if needed) and generate missing pgvector embeddings."""
-    model_name = settings.EMBEDDING_MODEL.strip() or REQUIRED_EMBEDDING_MODEL
-    if model_name != REQUIRED_EMBEDDING_MODEL:
-        raise AppError(
-            message=f"Unsupported embedding model '{model_name}'. Expected '{REQUIRED_EMBEDDING_MODEL}'.",
-            status_code=status.HTTP_400_BAD_REQUEST,
-            code="invalid_embedding_model",
+    """Chunk repository files (if needed) and generate missing 384-dim Gemini pgvector embeddings."""
+    model_name = REQUIRED_EMBEDDING_MODEL
+
+    # Remove any legacy embeddings from a different model so vector space stays consistent
+    db.execute(
+        delete(CodeEmbedding).where(
+            CodeEmbedding.repository_id == repository_id,
+            CodeEmbedding.embedding_model != model_name,
         )
+    )
+    db.commit()
 
     chunk_stats = create_or_update_repository_chunks(db, repository_id)
 
-    # Fetch only chunks that do not yet have a CodeEmbedding
     pending_chunks = db.execute(
         select(CodeChunk)
         .outerjoin(CodeEmbedding, CodeEmbedding.chunk_id == CodeChunk.id)
@@ -194,7 +160,10 @@ def generate_repository_embeddings(db: Session, repository_id: UUID, settings: S
             .scalar_subquery(),
             select(func.count())
             .select_from(CodeEmbedding)
-            .where(CodeEmbedding.repository_id == repository_id)
+            .where(
+                CodeEmbedding.repository_id == repository_id,
+                CodeEmbedding.embedding_model == model_name,
+            )
             .scalar_subquery(),
         )
     ).one()
@@ -215,7 +184,7 @@ def generate_repository_embeddings(db: Session, repository_id: UUID, settings: S
 
 def get_embedding_status(db: Session, repository_id: UUID, settings: Settings) -> dict:
     """Return current chunk and pgvector embedding counts for a repository in a single DB query."""
-    model_name = settings.EMBEDDING_MODEL.strip() or REQUIRED_EMBEDDING_MODEL
+    model_name = REQUIRED_EMBEDDING_MODEL
     counts = db.execute(
         select(
             select(func.count())
@@ -224,7 +193,10 @@ def get_embedding_status(db: Session, repository_id: UUID, settings: Settings) -
             .scalar_subquery(),
             select(func.count())
             .select_from(CodeEmbedding)
-            .where(CodeEmbedding.repository_id == repository_id)
+            .where(
+                CodeEmbedding.repository_id == repository_id,
+                CodeEmbedding.embedding_model == model_name,
+            )
             .scalar_subquery(),
         )
     ).one()

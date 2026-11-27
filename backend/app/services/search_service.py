@@ -15,8 +15,7 @@ def semantic_search_repository(
     top_k: int = 5,
 ) -> list[dict]:
     """Search code chunks within a single repository using pgvector cosine similarity."""
-    model_name = settings.EMBEDDING_MODEL.strip() or REQUIRED_EMBEDDING_MODEL
-    query_vectors = embed_texts([query], model_name=model_name)
+    query_vectors = embed_texts([query], model_name=REQUIRED_EMBEDDING_MODEL)
     if not query_vectors:
         return []
     query_vector = query_vectors[0]
@@ -27,6 +26,7 @@ def semantic_search_repository(
         .join(CodeEmbedding, CodeEmbedding.chunk_id == CodeChunk.id)
         .where(
             CodeEmbedding.repository_id == repository_id,
+            CodeEmbedding.embedding_model == REQUIRED_EMBEDDING_MODEL,
             CodeChunk.repository_id == repository_id,
         )
         .order_by(distance_expr.asc())

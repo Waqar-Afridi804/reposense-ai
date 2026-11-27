@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     MAX_FILES_PER_REPO: int = 250
     GEMINI_API_KEY: str = ""
     GEMINI_MODEL: str = "gemini-3-flash-preview"
-    EMBEDDING_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"
+    EMBEDDING_MODEL: str = "gemini-embedding-001"
     HF_TOKEN: str = ""
 
     # CORS
